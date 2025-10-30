@@ -1,0 +1,8 @@
+flask
+pillow
+transformers
+safetensors
+torch
+torchvision
+# Note: Install torch/torchvision matching your platform. For many systems, this works:
+# pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision

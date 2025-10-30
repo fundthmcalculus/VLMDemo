@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>VLM Demo</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 20px; }
+    #container { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
+    video, canvas { width: 100%; max-width: 640px; background: #000; border-radius: 8px; }
+    #desc { white-space: pre-wrap; padding: 12px; border: 1px solid #ddd; border-radius: 8px; min-height: 3em; }
+    .muted { color: #666; font-size: 0.9em; }
+    button { padding: 8px 12px; font-size: 14px; }
+    select { padding: 6px 8px; }
+    .row { display:flex; gap:8px; align-items:center; flex-wrap: wrap; }
+  </style>
+</head>
+<body>
+  <h1>Vision-Language Model Demo</h1>
+  <p class="muted">This page will request access to your webcam, capture a frame about once per second, send it to the server, and show the model's description.</p>
+
+  <div id="container">
+    <div>
+      <video id="video" autoplay playsinline></video>
+      <div class="row" style="margin-top:8px;">
+        <button id="toggleBtn">Pause</button>
+        <label for="modelSelect" class="muted">Model:</label>
+        <select id="modelSelect"></select>
+        <span id="status" class="muted">Initializing...</span>
+      </div>
+    </div>
+    <div>
+      <h3>Model Description</h3>
+      <div id="desc" class="muted">Waiting for first frame...</div>
+      <div class="muted" style="margin-top:8px;">Active model: <span id="activeModel">(loading)</span></div>
+      <h4 style="margin-top:16px;">Timestamps</h4>
+      <div id="ts" class="muted"></div>
+    </div>
+  </div>
+
+  <canvas id="canvas" style="display:none;"></canvas>
+
+  <script>
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const descEl = document.getElementById('desc');
+    const statusEl = document.getElementById('status');
+    const tsEl = document.getElementById('ts');
+    const toggleBtn = document.getElementById('toggleBtn');
+    const modelSelect = document.getElementById('modelSelect');
+    const activeModelEl = document.getElementById('activeModel');
+
+    let running = true;
+    let intervalMs = 1000; // ~1 FPS
+    let timer = null;
+
+    async function initModels() {
+      try {
+        const resp = await fetch('/api/models');
+        const data = await resp.json();
+        const models = data.models || [];
+        const def = data.default;
+        modelSelect.innerHTML = '';
+        models.forEach(m => {
+          const opt = document.createElement('option');
+          opt.value = m.id;
+          opt.textContent = m.display + (m.loaded ? ' • loaded' : '');
+          if (m.default) opt.selected = true;
+          modelSelect.appendChild(opt);
+        });
+        const saved = localStorage.getItem('selectedModel');
+        if (saved && models.some(m => m.id === saved)) {
+          modelSelect.value = saved;
+        }
+        updateActiveModel();
+        modelSelect.addEventListener('change', () => {
+          localStorage.setItem('selectedModel', modelSelect.value);
+          updateActiveModel();
+        });
+      } catch (e) {
+        console.error('Failed to load models', e);
+      }
+    }
+
+    function updateActiveModel() {
+      activeModelEl.textContent = modelSelect.value || '(default)';
+    }
+
+    async function initCamera() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        video.srcObject = stream;
+        await video.play();
+        statusEl.textContent = 'Camera ready';
+        startLoop();
+      } catch (err) {
+        statusEl.textContent = 'Camera error: ' + err.message;
+        console.error(err);
+      }
+    }
+
+    function startLoop() {
+      stopLoop();
+      timer = setInterval(captureAndSend, intervalMs);
+    }
+
+    function stopLoop() {
+      if (timer) clearInterval(timer);
+      timer = null;
+    }
+
+    toggleBtn.addEventListener('click', () => {
+      running = !running;
+      toggleBtn.textContent = running ? 'Pause' : 'Resume';
+      if (running) startLoop(); else stopLoop();
+    });
+
+    let isRunning = false;
+
+    async function captureAndSend() {
+      if (isRunning) {
+          // This is to prevent overwhelming the backend.
+          return;
+      }
+      isRunning = true;
+      if (!video.videoWidth || !video.videoHeight) return;
+      const selectedModel = modelSelect.value;
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+      statusEl.textContent = 'Capturing…';
+
+      // Send as JPEG via multipart/form-data for compatibility and size
+      const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.8));
+      const formData = new FormData();
+      formData.append('image', blob, 'frame.jpg');
+      if (selectedModel) formData.append('model', selectedModel);
+
+      const started = Date.now();
+      try {
+        const resp = await fetch('/api/describe', { method: 'POST', body: formData });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const data = await resp.json();
+        const latency = Date.now() - started;
+        descEl.textContent = data.description || '(no description)';
+        descEl.classList.remove('muted');
+        statusEl.textContent = 'OK • ' + latency + ' ms';
+        tsEl.textContent = new Date().toLocaleTimeString();
+        if (data.model) {
+          activeModelEl.textContent = data.model;
+        }
+      } catch (err) {
+        statusEl.textContent = 'Error: ' + err.message;
+        console.error(err);
+      }
+      isRunning = false;
+    }
+
+    initModels();
+    initCamera();
+  </script>
+</body>
+</html>
