@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Text → Image</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 20px; }
+    .row { display:flex; gap:8px; align-items:center; flex-wrap: wrap; }
+    textarea { width: 100%; min-height: 96px; padding: 8px; font-size: 14px; }
+    button { padding: 8px 12px; font-size: 14px; }
+    select, input[type=number] { padding: 6px 8px; }
+    .muted { color: #666; font-size: 0.9em; }
+    #out { margin-top: 16px; display:grid; grid-template-columns: 1fr 1fr; gap:16px; align-items:start; }
+    #result { width: 100%; max-width: 512px; border: 1px solid #ddd; border-radius: 8px; }
+    #json { white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; background:#fafafa; border:1px solid #eee; border-radius:8px; padding:8px; }
+  </style>
+</head>
+<body>
+  <h1>Text → Image</h1>
+  <p class="muted">Enter a prompt and generate an image on the server using a selectable text-to-image model. The model pipeline is cached in memory for faster subsequent generations.</p>
+
+  <div class="row" style="margin: 8px 0;">
+    <label for="model" class="muted">Model:</label>
+    <select id="model"></select>
+    <label for="steps" class="muted">Steps:</label>
+    <input id="steps" type="number" min="1" max="50" value="6" style="width:80px;" />
+    <label for="guidance" class="muted" title="CFG scale; 0 = no guidance">Guidance:</label>
+    <input id="guidance" type="number" step="0.1" min="0" max="20" value="0.0" style="width:90px;" />
+    <label for="width" class="muted">W:</label>
+    <input id="width" type="number" min="256" max="1024" step="64" value="512" style="width:90px;" />
+    <label for="height" class="muted">H:</label>
+    <input id="height" type="number" min="256" max="1024" step="64" value="512" style="width:90px;" />
+  </div>
+
+  <textarea id="prompt" placeholder="A cozy cabin in the woods at twilight, cinematic lighting"></textarea>
+  <div class="row" style="margin-top:8px;">
+    <button id="go">Generate</button>
+    <span id="status" class="muted">Idle</span>
+  </div>
+
+  <div id="out">
+    <div>
+      <h3>Result</h3>
+      <img id="result" alt="Generated image will appear here" />
+    </div>
+    <div>
+      <h3>Details</h3>
+      <div id="json" class="muted">No request made yet.</div>
+      <h4 style="margin-top:12px;">Latency</h4>
+      <div class="muted">Infer: <span id="infer">–</span> ms</div>
+      <div class="muted">Total: <span id="total">–</span> ms</div>
+      <div class="muted">Timestamp: <span id="ts">–</span></div>
+    </div>
+  </div>
+
+  <script>
+    const modelSel = document.getElementById('model');
+    const stepsEl = document.getElementById('steps');
+    const guidanceEl = document.getElementById('guidance');
+    const widthEl = document.getElementById('width');
+    const heightEl = document.getElementById('height');
+    const promptEl = document.getElementById('prompt');
+    const goBtn = document.getElementById('go');
+    const statusEl = document.getElementById('status');
+    const imgEl = document.getElementById('result');
+    const jsonEl = document.getElementById('json');
+    const inferEl = document.getElementById('infer');
+    const totalEl = document.getElementById('total');
+    const tsEl = document.getElementById('ts');
+
+    async function loadModels() {
+      try {
+        const resp = await fetch('/api/t2i_models');
+        const data = await resp.json();
+        const models = data.models || [];
+        modelSel.innerHTML = '';
+        models.forEach(m => {
+          const opt = document.createElement('option');
+          opt.value = m.id;
+          opt.textContent = m.display + (m.loaded ? ' • loaded' : '');
+          if (m.default) opt.selected = true;
+          modelSel.appendChild(opt);
+        });
+        const saved = localStorage.getItem('t2i_model');
+        if (saved && models.some(m => m.id === saved)) {
+          modelSel.value = saved;
+        }
+        modelSel.addEventListener('change', () => {
+          localStorage.setItem('t2i_model', modelSel.value);
+        });
+      } catch (e) {
+        console.error('Failed to get models', e);
+      }
+    }
+
+    async function generate() {
+      const prompt = promptEl.value.trim();
+      if (!prompt) {
+        statusEl.textContent = 'Please enter a prompt';
+        return;
+      }
+      const body = {
+        prompt,
+        model: modelSel.value,
+        steps: Number(stepsEl.value || 6),
+        guidance_scale: Number(guidanceEl.value || 0),
+        width: Number(widthEl.value || 512),
+        height: Number(heightEl.value || 512),
+      };
+      const t0 = performance.now();
+      statusEl.textContent = 'Generating…';
+      goBtn.disabled = true;
+      try {
+        const resp = await fetch('/api/text2image', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const t1 = performance.now();
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({ error: 'HTTP ' + resp.status }));
+          throw new Error(err.error || ('HTTP ' + resp.status));
+        }
+        const data = await resp.json();
+        imgEl.src = data.image_base64 || '';
+        inferEl.textContent = data.infer_ms ?? 'n/a';
+        totalEl.textContent = data.total_ms ?? Math.round(t1 - t0);
+        tsEl.textContent = data.timestamp || new Date().toISOString();
+        jsonEl.textContent = JSON.stringify({ ...body, model: data.model }, null, 2);
+        statusEl.textContent = 'OK';
+      } catch (e) {
+        statusEl.textContent = 'Error: ' + e.message;
+        console.error(e);
+      } finally {
+        goBtn.disabled = false;
+      }
+    }
+
+    goBtn.addEventListener('click', generate);
+    loadModels();
+  </script>
+</body>
+</html>

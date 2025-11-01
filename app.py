@@ -10,6 +10,8 @@ from flask import Flask, jsonify, request, render_template
 from PIL import Image
 
 from transformers import pipeline
+from diffusers import StableDiffusionPipeline
+import torch
 
 app = Flask(__name__)
 
@@ -22,6 +24,21 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s - %(message)s",
 )
 logger = logging.getLogger("vlm_demo")
+
+# ---------- Text-to-Image (T2I) configuration ----------
+T2I_DEFAULT_MODEL = os.environ.get("T2I_MODEL", "amd/Nitro-E")
+T2I_DEFAULT_MODELS = [
+    "amd/Nitro-E",                    # Requested default
+    "stabilityai/sd-turbo",          # Fast SD on small GPUs/CPUs
+    "runwayml/stable-diffusion-v1-5",# Widely available baseline
+    "Lykon/dreamshaper-6",           # Popular SD 1.5 derivative
+]
+ALLOWED_T2I_MODELS = [m.strip() for m in os.environ.get("ALLOWED_T2I_MODELS", ",".join(T2I_DEFAULT_MODELS)).split(",") if m.strip()]
+
+# Caches for pipelines
+_t2i_cache = {}
+_device = "cuda" if torch.cuda.is_available() else ("mps" if getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available() else "cpu")
+_dtype = torch.float16 if _device in ("cuda", "mps") else torch.float32
 
 # Curated small vision captioning models (mostly CPU-friendly). Override with ALLOWED_MODELS env (comma-separated) if desired.
 DEFAULT_MODELS = [
@@ -55,6 +72,8 @@ def init_captioner():
 
 # Eagerly load the default model at startup
 init_captioner()
+# Preload the default T2I model in a background thread
+init_t2i()
 
 
 def get_pipeline_for_model(model_name: str):
@@ -79,6 +98,52 @@ def get_captioner():
     # Backward-compatible accessor for default model
     return get_pipeline_for_model(MODEL_NAME)
 
+# ----------------- Text-to-Image helpers -----------------
+
+def _build_t2i_pipeline(model_name: str):
+    logger.info(f"Loading T2I model: {model_name} on device={_device} dtype={_dtype}")
+    t0 = time.time()
+    pipe = StableDiffusionPipeline.from_pretrained(model_name, torch_dtype=_dtype)
+    try:
+        pipe.to(_device)
+    except Exception:
+        logger.exception("Failed to move pipeline to device, falling back to CPU")
+        pipe.to("cpu")
+    # Some memory optimizations for low VRAM/CPU
+    try:
+        pipe.enable_attention_slicing()
+    except Exception:
+        pass
+    load_s = time.time() - t0
+    logger.info(f"T2I model {model_name} loaded in {load_s:.2f}s")
+    return pipe
+
+
+def get_t2i_pipeline_for_model(model_name: str):
+    if model_name not in ALLOWED_T2I_MODELS:
+        logger.warning(f"Requested T2I model '{model_name}' not allowed; using default '{T2I_DEFAULT_MODEL}'")
+        model_name = T2I_DEFAULT_MODEL
+    with _cache_lock:
+        if model_name in _t2i_cache:
+            logger.debug(f"Using cached T2I pipeline for {model_name}")
+            return _t2i_cache[model_name]
+    pipe = _build_t2i_pipeline(model_name)
+    with _cache_lock:
+        _t2i_cache[model_name] = pipe
+    return pipe
+
+
+def init_t2i():
+    # Eagerly load default T2I model in background to reduce first-hit latency
+    def _load():
+        try:
+            get_t2i_pipeline_for_model(T2I_DEFAULT_MODEL)
+            logger.info(f"Preloaded T2I default model: {T2I_DEFAULT_MODEL}")
+        except Exception:
+            logger.exception("Failed to preload T2I model")
+    th = threading.Thread(target=_load, daemon=True)
+    th.start()
+
 
 @app.get("/")
 def index():
@@ -86,9 +151,14 @@ def index():
     return render_template("index.html")
 
 
+@app.get("/text2image")
+def text2image_page():
+    return render_template("text2image.html")
+
+
 @app.get("/api/models")
 def list_models():
-    """Return allowed models and flag the default."""
+    """Return allowed caption models and flag the default."""
     models = []
     with _cache_lock:
         loaded = set(_pipeline_cache.keys())
@@ -99,11 +169,79 @@ def list_models():
             "default": m == MODEL_NAME,
             "loaded": m in loaded,
         })
-    logger.debug("Exposing model list: %s", models)
+    logger.debug("Exposing caption model list: %s", models)
     return jsonify({
         "models": models,
         "default": MODEL_NAME,
     })
+
+
+@app.get("/api/t2i_models")
+def list_t2i_models():
+    """Return allowed text-to-image models and flag the default."""
+    models = []
+    with _cache_lock:
+        loaded = set(_t2i_cache.keys())
+    for m in ALLOWED_T2I_MODELS:
+        models.append({
+            "id": m,
+            "display": m.split("/")[-1],
+            "default": m == T2I_DEFAULT_MODEL,
+            "loaded": m in loaded,
+        })
+    logger.debug("Exposing T2I model list: %s", models)
+    return jsonify({
+        "models": models,
+        "default": T2I_DEFAULT_MODEL,
+    })
+
+
+def _img_to_base64_jpeg(img: Image.Image, quality: int = 85) -> str:
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+@app.post("/api/text2image")
+def text2image():
+    req_id = datetime.utcnow().strftime("%H%M%S%f")
+    t0 = time.time()
+    try:
+        data = request.get_json(silent=True) or {}
+        # Allow form too
+        if not data and request.form:
+            data = request.form
+        prompt = (data.get("prompt") or "").strip()
+        if not prompt:
+            logger.warning(f"{req_id} no prompt provided from {request.remote_addr}")
+            return jsonify({"error": "No prompt provided"}), 400
+        selected_model = data.get("model") or T2I_DEFAULT_MODEL
+        steps = int(data.get("steps") or os.environ.get("T2I_STEPS", "6"))
+        guidance = float(data.get("guidance_scale") or os.environ.get("T2I_GUIDANCE", "0.0"))
+        width = int(data.get("width") or 512)
+        height = int(data.get("height") or 512)
+
+        logger.info(f"{req_id} t2i prompt_len={len(prompt)} model={selected_model} from {request.remote_addr} ua={request.user_agent.string}")
+
+        pipe = get_t2i_pipeline_for_model(selected_model)
+        t_inf0 = time.time()
+        with torch.inference_mode():
+            images = pipe(prompt, num_inference_steps=steps, guidance_scale=guidance, width=width, height=height).images
+        infer_ms = int((time.time() - t_inf0) * 1000)
+        img = images[0]
+        b64 = _img_to_base64_jpeg(img)
+        total_ms = int((time.time() - t0) * 1000)
+        logger.info(f"{req_id} t2i ok model={selected_model} infer={infer_ms}ms total={total_ms}ms size={width}x{height}")
+        return jsonify({
+            "image_base64": f"data:image/jpeg;base64,{b64}",
+            "model": selected_model,
+            "infer_ms": infer_ms,
+            "total_ms": total_ms,
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        })
+    except Exception:
+        logger.exception(f"{req_id} t2i error processing prompt from {request.remote_addr}")
+        return jsonify({"error": "internal server error"}), 500
 
 
 @app.post("/api/describe")
@@ -167,13 +305,23 @@ def describe_image():
 @app.get("/health")
 def health():
     with _cache_lock:
-        loaded = list(_pipeline_cache.keys())
+        loaded_caps = list(_pipeline_cache.keys())
+        loaded_t2i = list(_t2i_cache.keys())
     return jsonify({
         "status": "ok",
-        "model": MODEL_NAME,
-        "loaded": _captioner is not None,
-        "allowed_models": ALLOWED_MODELS,
-        "loaded_models": loaded,
+        "caption": {
+            "default_model": MODEL_NAME,
+            "loaded": _captioner is not None,
+            "allowed_models": ALLOWED_MODELS,
+            "loaded_models": loaded_caps,
+        },
+        "t2i": {
+            "default_model": T2I_DEFAULT_MODEL,
+            "allowed_models": ALLOWED_T2I_MODELS,
+            "loaded_models": loaded_t2i,
+            "device": _device,
+            "dtype": str(_dtype),
+        }
     })
 
 

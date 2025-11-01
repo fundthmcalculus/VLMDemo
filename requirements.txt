@@ -1,6 +1,8 @@
 flask
 pillow
 transformers
+diffusers
+accelerate
 safetensors
 torch
 torchvision
