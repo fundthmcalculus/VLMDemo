@@ -26,7 +26,7 @@ logging.basicConfig(
 logger = logging.getLogger("vlm_demo")
 
 # ---------- Text-to-Image (T2I) configuration ----------
-T2I_DEFAULT_MODEL = os.environ.get("T2I_MODEL", "amd/Nitro-E")
+T2I_DEFAULT_MODEL = os.environ.get("T2I_MODEL", "runwayml/stable-diffusion-v1-5")
 T2I_DEFAULT_MODELS = [
     "amd/Nitro-E",                    # Requested default
     "stabilityai/sd-turbo",          # Fast SD on small GPUs/CPUs
@@ -69,11 +69,6 @@ def init_captioner():
         _captioner = _build_pipeline(MODEL_NAME)
         with _cache_lock:
             _pipeline_cache[MODEL_NAME] = _captioner
-
-# Eagerly load the default model at startup
-init_captioner()
-# Preload the default T2I model in a background thread
-init_t2i()
 
 
 def get_pipeline_for_model(model_name: str):
@@ -134,15 +129,11 @@ def get_t2i_pipeline_for_model(model_name: str):
 
 
 def init_t2i():
-    # Eagerly load default T2I model in background to reduce first-hit latency
-    def _load():
-        try:
-            get_t2i_pipeline_for_model(T2I_DEFAULT_MODEL)
-            logger.info(f"Preloaded T2I default model: {T2I_DEFAULT_MODEL}")
-        except Exception:
-            logger.exception("Failed to preload T2I model")
-    th = threading.Thread(target=_load, daemon=True)
-    th.start()
+    try:
+        get_t2i_pipeline_for_model(T2I_DEFAULT_MODEL)
+        logger.info(f"Preloaded T2I default model: {T2I_DEFAULT_MODEL}")
+    except Exception:
+        logger.exception("Failed to preload T2I model")
 
 
 @app.get("/")
@@ -326,5 +317,9 @@ def health():
 
 
 if __name__ == '__main__':
+    # Eagerly load the default model at startup
+    init_captioner()
+    # Preload the default T2I model in a background thread
+    init_t2i()
     # Bind to all interfaces so it can be opened from other devices if needed
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=True)
